@@ -1,4 +1,5 @@
 chroma_db/
+.chainlit/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

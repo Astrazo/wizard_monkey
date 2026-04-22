@@ -5,6 +5,7 @@ from langchain_core.runnables import RunnablePassthrough
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel  # data validation library
+from chainlit.utils import mount_chainlit
 
 
 # Load existing Chroma DB
@@ -60,3 +61,6 @@ async def stream_generator(question: str):
 @app.post("/stream")
 async def stream_query(request: QueryRequest):
     return StreamingResponse(stream_generator(request.query), media_type="text/plain")
+
+
+mount_chainlit(app=app, target="cl_app.py", path="/chainlit")
