@@ -1,5 +1,7 @@
 chroma_db/
 .chainlit/
+.vscode/
+.files/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
