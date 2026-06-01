@@ -1,73 +1,130 @@
-from langchain_community.document_loaders import PyPDFLoader, CSVLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+#from langchain_community.document_loaders import PyPDFLoader, CSVLoader
+from langchain_docling.loader import DoclingLoader
 from pathlib import Path
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
+import hashlib
+
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.exceptions import ConversionError
+
+# 1. Read documents
+# 2. Extract pages
+# 3. Decide how to chunk/split text
+# 4. Embed using nomad
+# 5. Store in Chroma DB.
+
+converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(
+            pipeline_options=PdfPipelineOptions(
+                do_ocr=False,
+                do_table_structure=True
+            )
+        )
+    }
+)
+
+def generate_chunk_hash(chunk, index):
+    source = chunk.metadata.get("source")
+    pages = chunk.metadata.get("pages")
+    content = chunk.page_content
+    chunk_id = hashlib.sha1(f"{source}|{pages}|{index}|{content}".encode()).hexdigest()
+    return chunk_id
+
+def prepare_chunk(chunk, index):
+    chunk.metadata = simplify_docling_metadata(chunk.metadata)
+    chunk.metadata["chunk_hash"] = generate_chunk_hash(chunk, index)
+    chunk.metadata["chunk_index"] = index
+    return chunk
 
 
-def load_documents(directory: Path) -> list:
+def ingest(directory: Path, vector_db: Chroma) -> None:
     print(f"Loading documents from path {directory}...")
-    # Load in a document
-    pages = []
-    docs_found = 0
+    # Load in the documents
     pdf_files = directory.rglob("*.pdf")
-    csv_files = directory.rglob("*.csv")
+    #csv_files = directory.rglob("*.csv")
+    files_found = 0
 
     for file in pdf_files:
         print(f"Found pdf file: {file.name}")
-        loader = PyPDFLoader(file)
-        pages.extend(loader.load())
-        docs_found += 1
+        files_found += 1
+        loader = DoclingLoader(file, converter=converter)
+        chunks_loaded = 0
+        chunks = []
 
-    for file in csv_files:
-        print(f"Found csv file: {file.name}")
-        loader = CSVLoader(file)
-        pages.extend(loader.load())
-        docs_found += 1
-    print(f"{len(pages)} pages loaded in from {docs_found} documents.\n")
-    return pages
+        try:
+            # Chunk the file
+            for idx, chunk in enumerate(loader.lazy_load()):
+                
+                # Prepare this chunk
+                prepared_chunk = prepare_chunk(chunk, idx)
+                chunks.append(prepared_chunk)
 
-def chunk_documents(docs: list, chunk_size: int, chunk_overlap: float) -> list:
-    # Split it into chunks
-    # this is in characters, not tokens.  Research states to start with 15% overlap and 256 tokens for this
-    # since there's 3/4 characters in a token, multiply 256 by 4 roughtyly.  15% of 1000 is 150 for overlap. 
-    chunk_size *= 4 # * 4 for the character equivilant
-    chunk_overlap_chars = int(chunk_size * chunk_overlap)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap_chars) 
-    splits = text_splitter.split_documents(docs)
-    
-    # Add Ids to the chunks for chroma to use to not duplicate chunks
-    for i, chunk in enumerate(splits):
-        chunk.metadata["chunk_index"] = i
-    print(f"Split documents into {len(splits)}, {chunk_size} character long chunks.\n")
-    return splits
+                # If this is a big file, we don't want chunks getting too big, so stop, prepare and embed
+                if len(chunks) >= 100:
+                    chunks_loaded += len(chunks)
+                    ids = [chunk.metadata["chunk_hash"] for chunk in chunks]
+                    vector_db.add_documents(documents=chunks, ids=ids)
+                    chunks.clear()
+        except ConversionError as error:
+            print(f"Docling failed for {file}: {error}")
+            chunks.clear()
+            continue
 
-def embed_splits(splits: list, vector_db: Chroma) -> None:
-    ids = [f"{chunk.metadata['source']}:{chunk.metadata['page']}:{chunk.metadata['chunk_index']}" for chunk in splits]
-    print("Chunks being embedded into Chroma DB...")
-    vector_db.add_documents(documents=splits, ids=ids)
-    print("Chunks embedded into Chroma DB.")
+        # Embed any remaining chunks
+        if len(chunks) > 0:
+            chunks_loaded += len(chunks)
+            ids = [chunk.metadata["chunk_hash"] for chunk in chunks]
+            vector_db.add_documents(documents=chunks, ids=ids)
 
-# Load documents
-shared_path = Path("Y:\Documents")
-josh_path = Path("Z:\Documents")
-shared_docs = load_documents(shared_path)
-josh_docs = load_documents(josh_path)
+        print(f"{chunks_loaded} chunks loaded from document {file.name}.")
 
-shared_docs.extend(josh_docs)
-full_docs = shared_docs
+    print(f"{files_found} files processed.")
 
-# Split the documents
-splits = chunk_documents(full_docs, chunk_size=256, chunk_overlap=0.15)
+def simplify_docling_metadata(metadata: dict) -> dict:
+    source = str(metadata.get("source", ""))
+    dl_meta = metadata.get("dl_meta", {})
+    origin = dl_meta.get("origin", {})
+    headings = dl_meta.get("headings", [])
+    doc_items = dl_meta.get("doc_items", [])
 
-# Embed 
-embed_function = OllamaEmbeddings(model="nomic-embed-text")
+    pages = set()
+
+    for item in doc_items:
+        for prov in item.get("prov", []):
+            page_no = prov.get("page_no")
+            if page_no is not None:
+                pages.add(page_no)
+
+    return {
+        "source": source,
+        "filename": str(origin.get("filename") or Path(source).name),
+        "pages": ",".join(str(page) for page in sorted(pages)),
+        "headings": " > ".join(headings),
+        "mimetype": str(origin.get("mimetype", "")),
+    }
+
+
+# Set document paths
+shared_path = Path(r"Y:\Documents")
+josh_path = Path(r"Z:\Documents")
+
+# Define Embedding model
+embed_model = OllamaEmbeddings(model="nomic-embed-text")
+
+# Define Vector DB which takes in an Embedding Model
 vector_db = Chroma(
     collection_name="home_llm",
-    embedding_function=embed_function,
+    embedding_function=embed_model,
     persist_directory="chroma_db"
 )
-embed_splits(splits, vector_db=vector_db)
+
+# Ingest
+ingest(shared_path, vector_db)
+ingest(josh_path, vector_db)
 
 
 
